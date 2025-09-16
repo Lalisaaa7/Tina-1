@@ -1,39 +1,7 @@
 import os
+
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:64"
 import gc
-gc.collect()
-
-# 配置类
-class ModelConfig:
-    def __init__(self):
-        # 扩散模型参数
-        self.node_dim = 128  # 根据实际ESM特征维度调整
-        self.hidden_dim = 256
-        self.num_layers = 4
-        self.num_heads = 8
-        self.dropout = 0.1
-        self.diffusion_conv_type = 'gat'
-
-        # 边生成器参数
-        self.edge_hidden_dim = 256
-        self.edge_num_layers = 3
-        self.edge_conv_type = 'gcn'
-
-        # 训练参数
-        self.epochs = 100
-        self.batch_size = 2  # 减少批次大小
-        self.lr = 1e-3
-
-        # 扩散过程参数
-        self.beta_start = 1e-4
-        self.beta_end = 0.02
-        self.num_timesteps = 500
-
-        # 生成参数
-        self.num_new_nodes = 20  # 减少生成节点数量
-        self.edge_threshold = 0.3
-        self.max_edges_per_node = 4
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -49,42 +17,34 @@ from modules.data_loader import load_and_prepare_data
 from modules.model import GAT_with_Residual, train_model, test_model
 from modules.ddpm_diffusion_model import train_diffusion_model, generate_augmented_data
 import gc
-torch.cuda.empty_cache()  # 如果使用 GPU 的话
-gc.collect()  # 清理 CPU 内存
-device = torch.device('cpu')  # 强制使用CPU
 
-# 配置类
+
+# --- 配置类  ---
 class ModelConfig:
     def __init__(self):
-        # 扩散模型参数
-        self.node_dim = 128  # 根据实际ESM特征维度调整
+        self.node_dim = 128
         self.hidden_dim = 256
         self.num_layers = 4
         self.num_heads = 8
         self.dropout = 0.1
         self.diffusion_conv_type = 'gat'
-
-        # 边生成器参数
         self.edge_hidden_dim = 256
         self.edge_num_layers = 3
         self.edge_conv_type = 'gcn'
-
-        # 训练参数
         self.epochs = 100
-        self.batch_size = 2  # 减少批次大小
+        self.batch_size = 2
         self.lr = 1e-3
-
-        # 扩散过程参数
         self.beta_start = 1e-4
         self.beta_end = 0.02
         self.num_timesteps = 500
-
-        # 生成参数
-        self.num_new_nodes = 20  # 减少生成节点数量
+        # 这个值将被动态计算
+        self.num_new_nodes = 0
         self.edge_threshold = 0.3
         self.max_edges_per_node = 4
+        # 新增窗口大小参数
+        self.window_size = 5
 
-
+# FeatureReducer, DiffusionModel, EdgeGenerator, DiffusionProcess, train_diffusion_and_edge_models
 # 特征降维器
 class FeatureReducer(nn.Module):
     def __init__(self, input_dim, output_dim=128, hidden_dim=512):
@@ -300,6 +260,7 @@ class DiffusionProcess:
         """随机采样时间步"""
         return torch.randint(0, self.num_timesteps, (n,), device=self.device)
 
+
 # 训练扩散模型和边生成器
 def train_diffusion_and_edge_models(data_list, config, device):
     from torch_geometric.data import Data
@@ -418,9 +379,9 @@ def train_diffusion_and_edge_models(data_list, config, device):
                 edge_labels = torch.ones_like(edge_probs)
                 edge_loss = F.binary_cross_entropy(edge_probs, edge_labels)
 
-                print(f"使用 {max_edges_to_use} 条边训练边生成器")
+                # print(f"使用 {max_edges_to_use} 条边训练边生成器")
             else:
-                print("没有边，跳过边生成器训练")
+                # print("没有边，跳过边生成器训练")
                 skip_edge_train = True
 
         except RuntimeError as e:
@@ -440,290 +401,192 @@ def train_diffusion_and_edge_models(data_list, config, device):
                 f"Epoch {epoch}/{config.epochs} - Diffusion Loss: {diffusion_loss.item():.4f}, Edge Loss: {edge_loss.item():.4f}")
 
     return diffusion_model, edge_generator, diffusion
-# 生成新节点并合并到原图
-def generate_and_merge(data_list, diffusion_model, edge_generator, diffusion, config, device):
+
+
+def generate_and_merge(data_list, diffusion_model, diffusion, config, device):
+    """
+    生成新的正类节点，与旧节点合并，并使用滑动窗口为所有节点重建边。
+    """
     diffusion_model.eval()
-    edge_generator.eval()
 
+    # 1. 如果不需要生成节点，直接合并原始图并返回
+    if config.num_new_nodes <= 0:
+        print("无需生成新节点，仅合并原始图。")
+        all_x = torch.cat([d.x for d in data_list], dim=0)
+        all_y = torch.cat([d.y for d in data_list], dim=0)
+        # 需要正确地合并 edge_index
+        edge_index_list = []
+        node_offset = 0
+        for data in data_list:
+            edge_index_list.append(data.edge_index + node_offset)
+            node_offset += data.num_nodes
+        all_edge_index = torch.cat(edge_index_list, dim=1)
+        return Data(x=all_x, edge_index=all_edge_index, y=all_y)
+
+    # 2. 生成新的节点特征
+    print(f"计划生成 {config.num_new_nodes} 个新节点...")
     all_new_nodes = []
-
-    # 分批生成新节点
-    batch_size = min(100, config.num_new_nodes)
+    batch_size = 512  # 可以根据显存调整批大小
     num_batches = (config.num_new_nodes + batch_size - 1) // batch_size
 
-    for i in range(num_batches):
+    for i in tqdm(range(num_batches), desc="正在生成新节点"):
         current_batch_size = min(batch_size, config.num_new_nodes - i * batch_size)
-
         with torch.no_grad():
-            # 生成新节点
             x = torch.randn(current_batch_size, config.node_dim).to(device)
-
-            """反向扩散过程"""
-            # 从最大时间步开始反向去噪
             for t in reversed(range(diffusion.num_timesteps)):
                 t_batch = torch.full((current_batch_size,), t, device=device)
-
-                # 确保输入是3D格式
                 x_input = x.unsqueeze(0) if x.ndim == 2 else x
-                pred_noise = diffusion_model(x_input, t_batch)  # 使用训练好的扩散模型预测噪声
-                # 处理输出维度
+                pred_noise = diffusion_model(x_input, t_batch)
                 if pred_noise.ndim == 3:
                     pred_noise = pred_noise.squeeze(0)
-                # 获取当前时间步的参数
-                alpha = diffusion.alphas[t]# α_t = 1 - β_t
-                alpha_bar = diffusion.alpha_bars[t] # ᾱ_t
-                beta = diffusion.betas[t] # β_t
-                # 给前几步添加随机噪声
-                if t > 0:
-                    noise = torch.randn_like(x) # z ~ N(0, I)
-                else:
-                    noise = torch.zeros_like(x)
+
+                alpha = diffusion.alphas[t]
+                alpha_bar = diffusion.alpha_bars[t]
+                beta = diffusion.betas[t]
+
+                noise = torch.randn_like(x) if t > 0 else torch.zeros_like(x)
 
                 x = (1 / torch.sqrt(alpha)) * (
                         x - ((1 - alpha) / torch.sqrt(1 - alpha_bar)) * pred_noise
                 ) + torch.sqrt(beta) * noise
-
             all_new_nodes.append(x.cpu())
 
     new_nodes = torch.cat(all_new_nodes, dim=0)
     new_y = torch.ones(new_nodes.size(0), dtype=torch.long)
 
-    # 合并所有图数据
-    all_x = []
-    all_y = []
-    all_edge_index = []
-    node_offset = 0
+    # 3. 合并所有旧节点和新节点
+    original_x = torch.cat([d.x.cpu() for d in data_list], dim=0)
+    original_y = torch.cat([d.y.cpu() for d in data_list], dim=0)
 
-    for data in data_list:
-        # 确保 data 是 Data 对象
-        if isinstance(data, Data):
-            # 确保x是2维的并且移动到CPU
-            x_data = data.x.cpu()  # 确保在CPU上
-            if x_data.ndim == 3:
-                x_data = x_data.squeeze(0)  # 移除批次维度
-                print(f"调整张量维度: 从 3D -> 2D, 形状: {x_data.shape}")
-            elif x_data.ndim == 1:
-                x_data = x_data.unsqueeze(0)  # 添加特征维度
-                print(f"调整张量维度: 从 1D -> 2D, 形状: {x_data.shape}")
-            all_x.append(x_data)
+    updated_x = torch.cat([original_x, new_nodes], dim=0)
+    updated_y = torch.cat([original_y, new_y], dim=0)
 
-            # 确保y是1维的并且移动到CPU
-            y_data = data.y.cpu()  # 确保在CPU上
-            if y_data.ndim > 1:
-                y_data = y_data.squeeze()
-            all_y.append(y_data)
+    # 4. 为所有节点（新旧混合）重建边
+    print("正在为所有节点重建边...")
+    num_total_nodes = updated_x.size(0)
+    new_edge_index = []
+    window_size = config.window_size
 
-            # 调整边索引偏移并移动到CPU
-            edges = (data.edge_index + node_offset).cpu()  # 确保在CPU上
-            all_edge_index.append(edges)
+    for i in tqdm(range(num_total_nodes), desc="正在创建边"):
+        for j in range(i - window_size, i + window_size + 1):
+            if i != j and 0 <= j < num_total_nodes:
+                new_edge_index.append([i, j])
 
-            node_offset += data.num_nodes
-        else:
-            # 如果是元组，尝试提取 Data 对象
-            try:
-                if isinstance(data[0], Data):
-                    graph_data = data[0]
-                    # 确保x是2维的并且移动到CPU
-                    x_data = graph_data.x.cpu()  # 确保在CPU上
-                    if x_data.ndim == 3:
-                        x_data = x_data.squeeze(0)
-                        print(f"调整张量维度: 从 3D -> 2D, 形状: {x_data.shape}")
-                    elif x_data.ndim == 1:
-                        x_data = x_data.unsqueeze(0)
-                        print(f"调整张量维度: 从 1D -> 2D, 形状: {x_data.shape}")
-                    all_x.append(x_data)
+    updated_edge_index = torch.tensor(new_edge_index, dtype=torch.long).t().contiguous()
 
-                    # 确保y是1维的并且移动到CPU
-                    y_data = graph_data.y.cpu()  # 确保在CPU上
-                    if y_data.ndim > 1:
-                        y_data = y_data.squeeze()
-                    all_y.append(y_data)
+    # 5. 创建最终的图数据
+    updated_data = Data(x=updated_x, edge_index=updated_edge_index, y=updated_y)
 
-                    # 调整边索引偏移并移动到CPU
-                    edges = (graph_data.edge_index + node_offset).cpu()  # 确保在CPU上
-                    all_edge_index.append(edges)
-
-                    node_offset += graph_data.num_nodes
-                else:
-                    print(f"无法识别的数据类型: {type(data)}")
-            except:
-                print(f"无法处理数据: {type(data)}")
-
-    # 添加新节点（确保是2维的）
-    all_x.append(new_nodes)  # new_nodes 已经在CPU上
-    all_y.append(new_y)  # new_y 已经在CPU上
-
-    # 创建新节点之间的边（小批量处理）
-    new_edges = []
-    for i in range(new_nodes.size(0)):
-        for j in range(i + 1, min(i + 10, new_nodes.size(0))):  # 只连接附近节点
-            if torch.rand(1) < 0.3:  # 随机连接概率
-                new_edges.append([node_offset + i, node_offset + j])
-                new_edges.append([node_offset + j, node_offset + i])
-
-    if new_edges:
-        new_edge_tensor = torch.tensor(new_edges, dtype=torch.long).t()
-        all_edge_index.append(new_edge_tensor)
-
-    # 确保所有张量都在CPU上并且是2维的
-    for i, x_tensor in enumerate(all_x):
-        if x_tensor.device != torch.device('cpu'):
-            all_x[i] = x_tensor.cpu()
-        if x_tensor.ndim != 2:
-            print(f"调整张量 {i} 维度: 从 {x_tensor.ndim}D -> 2D")
-            if x_tensor.ndim == 3:
-                all_x[i] = x_tensor.reshape(-1, x_tensor.shape[-1])
-            elif x_tensor.ndim == 1:
-                all_x[i] = x_tensor.unsqueeze(-1)
-
-    # 合并所有数据
-    try:
-        updated_x = torch.cat(all_x, dim=0)
-        updated_y = torch.cat(all_y, dim=0)
-        updated_edge_index = torch.cat(all_edge_index, dim=1)
-    except Exception as e:
-        print(f"合并数据时出错: {e}")
-        print("各张量形状:", [x.shape for x in all_x])
-        print("各张量设备:", [x.device for x in all_x])
-        return None
-
-        # 确保节点和标签数量匹配
-    if updated_x.size(0) != updated_y.size(0):
-        print(f"警告: 节点数 ({updated_x.size(0)}) 和标签数 ({updated_y.size(0)}) 不匹配!")
-        print("进行截断处理...")
-        min_size = min(updated_x.size(0), updated_y.size(0))
-        updated_x = updated_x[:min_size]
-        updated_y = updated_y[:min_size]
-        print(f"截断后: 节点数={min_size}")
-
-        # 创建新图数据
-    updated_data = Data(
-        x=updated_x,
-        edge_index=updated_edge_index,
-        y=updated_y
-    )
-
-    print(f"生成 {new_nodes.size(0)} 个新节点")
-    print(f"生成 {len(new_edges) // 2} 条新边")
-    print(f"节点分布: 负类={sum(updated_y == 0)}, 正类={sum(updated_y == 1)}")
-    print(f"总节点数: {updated_x.size(0)}, 总标签数: {updated_y.size(0)}")
+    print("-" * 30)
+    print(f"数据增强完成!")
+    print(f"原始节点数: {original_x.size(0)}")
+    print(f"生成新节点数: {new_nodes.size(0)}")
+    print(f"总 节 点 数: {updated_data.num_nodes}")
+    print(f"新图总边数: {updated_data.num_edges}")
+    neg_count = (updated_y == 0).sum().item()
+    pos_count = (updated_y == 1).sum().item()
+    print(f"节点分布: 负类={neg_count}, 正类={pos_count} (比例 ≈ 1:{pos_count / neg_count:.2f})")
+    print("-" * 30)
 
     return updated_data
-# 主函数
-def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    config = ModelConfig()  # 创建配置实例
 
+
+# --- ain 主函数 ---
+def main():
+    gc.collect()
+    torch.cuda.empty_cache()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"当前设备: {device}")
+
+    config = ModelConfig()
 
     # 1. 加载数据
     folder = './Raw_data'
     train_data, val_data, test_data, feature_dim = load_and_prepare_data(folder, device)
 
-    # 2. 特征降维 (使用自编码器)
-    reducer = FeatureReducer(input_dim=feature_dim, output_dim=128).to(device)
-
-    # 训练特征降维器
-    reducer.train()
+    # 2. 特征降维 (逻辑保持不变)
+    print("开始训练特征降维器...")
+    reducer = FeatureReducer(input_dim=feature_dim, output_dim=config.node_dim).to(device)
     optimizer = torch.optim.Adam(reducer.parameters(), lr=1e-3)
-
-    # 收集所有训练数据用于训练降维器
-    all_train_x = []
-    for data in train_data:
-        all_train_x.append(data.x)
-    all_train_x = torch.cat(all_train_x, dim=0).to(device)
-
-    # 创建数据加载器
+    all_train_x = torch.cat([data.x for data in train_data], dim=0).to(device)
     dataset = torch.utils.data.TensorDataset(all_train_x)
-    loader = torch.utils.data.DataLoader(dataset, batch_size=8, shuffle=True)
+    loader = torch.utils.data.DataLoader(dataset, batch_size=256, shuffle=True)
 
-    for epoch in range(50):
+    for epoch in range(50):  # 降维器训练轮数可以减少
         epoch_loss = 0
         for batch in loader:
-            x = batch[0].to(device)
+            x = batch[0]
             optimizer.zero_grad()
-            encoded, decoded = reducer(x, return_reconstructed=True)
-            loss = F.mse_loss(decoded, x)  # 重建损失
+            _, decoded = reducer(x, return_reconstructed=True)
+            loss = F.mse_loss(decoded, x)
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
+        if (epoch + 1) % 10 == 0:
+            print(f"Reducer Epoch {epoch + 1}/50 - Loss: {epoch_loss / len(loader):.4f}")
 
-        print(f"Reducer Epoch {epoch + 1}/50 - Loss: {epoch_loss / len(loader):.4f}")
-
-    # 应用降维
     def reduce_features(data_list):
         reduced_data = []
         reducer.eval()
         with torch.no_grad():
             for data in data_list:
                 reduced_x = reducer(data.x.to(device)).cpu()
-                new_data = Data(x=reduced_x, edge_index=data.edge_index, y=data.y)
-                new_data.name = data.name
-                new_data.source_file = data.source_file
+                new_data = Data(x=reduced_x, edge_index=data.edge_index.cpu(), y=data.y.cpu())
+                new_data.name = getattr(data, 'name', '')
+                new_data.source_file = getattr(data, 'source_file', '')
                 reduced_data.append(new_data)
         return reduced_data
 
+    print("正在对数据集进行特征降维...")
     train_data = reduce_features(train_data)
     val_data = reduce_features(val_data)
     test_data = reduce_features(test_data)
-    feature_dim = 128  # 更新特征维度
+    config.node_dim = train_data[0].x.size(1)  # 更新特征维度
+    print(f"特征降维完成，新维度: {config.node_dim}")
 
-    # 3. 训练扩散模型和边生成器
-    print("训练扩散模型和边生成器...")
+    # 3. 计算需要生成的样本数以平衡数据
+    all_train_y = torch.cat([d.y for d in train_data], dim=0)
+    total_neg = (all_train_y == 0).sum().item()
+    total_pos = (all_train_y == 1).sum().item()
 
-    # 创建训练图列表
-    train_graphs = []
-    for data in train_data:
-        # 确保 data 是 Data 对象
-        if isinstance(data, Data):
-            train_graphs.append(data)
-        else:
-            # 如果是元组，尝试提取 Data 对象
-            try:
-                if isinstance(data[0], Data):
-                    train_graphs.append(data[0])
-                else:
-                    print(f"无法识别的数据类型: {type(data)}")
-            except:
-                print(f"无法处理数据: {type(data)}")
+    if total_neg > total_pos:
+        config.num_new_nodes = total_neg - total_pos
+    else:
+        config.num_new_nodes = 0
 
-    # 检查是否有有效数据
-    if not train_graphs:
-        print("没有有效的训练数据")
+    print(f"当前训练集: 正类={total_pos}, 负类={total_neg}")
+
+    # 4. 训练扩散模型 (逻辑保持不变)
+    print("训练扩散模型...")
+    diffusion_model, _, diffusion = train_diffusion_and_edge_models(
+        train_data, config, device
+    )
+
+    # 5. 生成新节点并合并，创建平衡的数据集
+    print("生成新节点并创建平衡的训练图...")
+    # 注意：这里不再需要 edge_generator
+    augmented_train_graph = generate_and_merge(
+        train_data, diffusion_model, diffusion, config, device
+    )
+
+    if augmented_train_graph is None or augmented_train_graph.num_nodes == 0:
+        print("错误：数据增强失败，程序终止。")
         return
 
-    diffusion_model, edge_generator, diffusion = train_diffusion_and_edge_models(
-        train_graphs, config, device
-    )
+    # 6. 训练GAT模型
+    print("使用增强后的平衡数据集训练GAT模型...")
+    # 将增强图放入一个列表中，以匹配 train_model 的输入格式
+    final_train_data = [augmented_train_graph.to(device)]
+    # 确保 test_data 也在正确的设备上
+    test_data_on_device = [d.to(device) for d in test_data]
 
-    # 4. 生成新节点并合并
-    print("生成新节点并合并到训练图...")
-    augmented_train_graph = generate_and_merge(
-        train_graphs, diffusion_model, edge_generator, diffusion, config, device
-    )
+    model = train_model(final_train_data, config.node_dim, device)
 
-    if augmented_train_graph is None:
-        print("数据合并失败，使用原始训练数据")
-        train_data = train_graphs
-    else:
-        # 验证合并后的数据
-        if augmented_train_graph.x.size(0) != augmented_train_graph.y.size(0):
-            print("合并后的数据仍然有问题，使用原始训练数据")
-            train_data = train_graphs
-        else:
-            train_data = [augmented_train_graph]
-            print(f"使用增强后的数据: {augmented_train_graph.num_nodes} 个节点")
-
-    # 5. 训练GAT模型
-    print("训练GAT模型...")
-    model = train_model(train_data, feature_dim, device)
-    # 5. 训练GAT模型
-    print("训练GAT模型...")
-    model = train_model(train_data, feature_dim, device)
-
-    # 6. 测试模型
+    # 7. 测试模型
     print("测试模型...")
-    test_metrics = test_model(model, test_data, device)
-    print(f"测试结果: 准确率={test_metrics['accuracy']:.4f}, F1={test_metrics['f1']:.4f}")
+    test_metrics = test_model(model, test_data_on_device, device)
+    print(
+        f"最终测试结果: 准确率={test_metrics['accuracy']:.4f}, F1={test_metrics['f1']:.4f}, MCC={test_metrics['mcc']:.4f}, AUC={test_metrics['auc']:.4f}")
 
 
 if __name__ == '__main__':
